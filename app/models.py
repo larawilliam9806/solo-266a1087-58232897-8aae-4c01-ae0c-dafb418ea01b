@@ -144,6 +144,31 @@ _BINDING_FIELD_ALIASES = {
     ),
 }
 
+_COMPLETION_FIELD_ALIASES = {
+    "completion_id": (
+        "completion_id",
+        "completionId",
+        "completion_no",
+        "completionNo",
+        "completion_number",
+        "completionNumber",
+        "id",
+        "number",
+    ),
+    "session_id": ("session_id", "sessionId", "session_no", "sessionNo", "session", "sid"),
+    "occurred_at": (
+        "occurred_at",
+        "occurredAt",
+        "completed_at",
+        "completedAt",
+        "utc_time",
+        "utcTime",
+        "timestamp",
+        "time",
+        "ts",
+    ),
+}
+
 
 class ExposureIn(BaseModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
@@ -220,3 +245,46 @@ class BindingIn(BaseModel):
         if isinstance(value, str) and not value.strip():
             return None
         return _clean_text(value, field="account_id", max_length=256)
+
+
+class CompletionIn(BaseModel):
+    """A finished-reading report; the session need not be bound yet."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    completion_id: str = Field(
+        validation_alias=AliasChoices(*_COMPLETION_FIELD_ALIASES["completion_id"])
+    )
+    session_id: str = Field(
+        validation_alias=AliasChoices(*_COMPLETION_FIELD_ALIASES["session_id"])
+    )
+    occurred_at: str = Field(
+        validation_alias=AliasChoices(*_COMPLETION_FIELD_ALIASES["occurred_at"])
+    )
+
+    _occurred_us: int = PrivateAttr(default=0)
+
+    @property
+    def occurred_us(self) -> int:
+        return self._occurred_us
+
+    @field_validator("completion_id", mode="before")
+    @classmethod
+    def _completion_id(cls, value: Any) -> str:
+        return _clean_text(value, field="completion_id", max_length=256)
+
+    @field_validator("session_id", mode="before")
+    @classmethod
+    def _session_id(cls, value: Any) -> str:
+        return _clean_text(value, field="session_id", max_length=256)
+
+    @field_validator("occurred_at", mode="before")
+    @classmethod
+    def _occurred_at(cls, value: Any) -> str:
+        canonical, _ = normalise_utc(value)
+        return canonical
+
+    @model_validator(mode="after")
+    def _derive_epoch(self) -> "CompletionIn":
+        _, self._occurred_us = normalise_utc(self.occurred_at)
+        return self

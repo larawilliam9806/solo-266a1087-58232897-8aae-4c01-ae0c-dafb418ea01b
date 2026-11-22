@@ -38,11 +38,15 @@ CREATE TABLE IF NOT EXISTS session_bindings (
 CREATE INDEX IF NOT EXISTS idx_bindings_account
     ON session_bindings (account_id);
 
--- Accounts that only saw one variant.  One row per account.
+-- Accounts that only saw one variant.  One row per account.  ``is_completer``
+-- records whether any session currently bound to the account finished reading
+-- within 24 hours of the account's first exposure; it makes the daily summary
+-- reversible when the account is re-derived.
 CREATE TABLE IF NOT EXISTS analysis_samples (
     account_id       TEXT PRIMARY KEY,
     variant          TEXT NOT NULL,
-    first_exposure_id TEXT NOT NULL
+    first_exposure_id TEXT NOT NULL,
+    is_completer     INTEGER NOT NULL DEFAULT 0
 );
 
 -- Accounts that saw more than one variant ("cross-group" accounts).  They are
@@ -59,7 +63,36 @@ CREATE TABLE IF NOT EXISTS analysis_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- Completion reports ("finished reading").  ``completion_id`` is the reported
+-- completion number; a replay must match the stored row exactly.  Reports are
+-- accepted before the session is bound and are matched against the binding at
+-- derivation time.
+CREATE TABLE IF NOT EXISTS completions (
+    completion_id TEXT PRIMARY KEY,
+    session_id    TEXT NOT NULL,
+    occurred_at   TEXT NOT NULL,
+    occurred_us   INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_completions_session
+    ON completions (session_id);
+
+-- Per UTC first-exposure day and group: how many sampled accounts have that
+-- day/group as their first exposure and how many of them completed reading.
+-- Kept in step with ``analysis_samples`` incrementally.
+CREATE TABLE IF NOT EXISTS analysis_daily (
+    exposure_day TEXT NOT NULL,
+    variant      TEXT NOT NULL,
+    sample_count INTEGER NOT NULL,
+    completer_count INTEGER NOT NULL,
+    PRIMARY KEY (exposure_day, variant)
+);
 """
+
+SCHEMA_VERSION = 2
+
+COMPLETION_WINDOW_US = 24 * 60 * 60 * 1_000_000
 
 DEFAULT_DATABASE_PATH = Path("data") / "experiment.sqlite3"
 
@@ -92,9 +125,48 @@ def init_db(path: Path) -> None:
     conn = connect(path)
     try:
         conn.execute("PRAGMA journal_mode = WAL")
-        conn.executescript(SCHEMA)
+        _migrate(conn)
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Create the schema and upgrade a database written by an older version.
+
+    ``CREATE TABLE IF NOT EXISTS`` leaves an old ``analysis_samples`` table
+    alone, so the new completer flag is added explicitly.  The daily summary is
+    then rebuilt from the stored sample, which makes it queryable immediately
+    after an upgrade.  Both steps are idempotent: a crash in between simply
+    means the next start repeats them.
+
+    A v1 database cannot tell which sampled accounts completed (completion
+    reports were not collected yet), so upgraded accounts start as
+    non-completers; the first re-derivation of each account fills in the flag
+    from whatever reports are stored by then.
+    """
+
+    conn.executescript(SCHEMA)
+
+    # Imported lazily: the analysis module is built on top of this module.
+    from .experiment import rebuild_daily_summary
+
+    # One writer at a time, so concurrent starts cannot race on the ALTER or
+    # the summary rebuild.
+    with transaction(conn):
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(analysis_samples)")
+        }
+        if "is_completer" not in columns:
+            conn.execute(
+                "ALTER TABLE analysis_samples "
+                "ADD COLUMN is_completer INTEGER NOT NULL DEFAULT 0"
+            )
+        rebuild_daily_summary(conn)
+        conn.execute(
+            "INSERT INTO analysis_meta (key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(SCHEMA_VERSION),),
+        )
 
 
 @contextmanager

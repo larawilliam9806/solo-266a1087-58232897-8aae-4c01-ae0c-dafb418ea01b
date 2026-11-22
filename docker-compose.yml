@@ -1,0 +1,24 @@
+services:
+  experiment:
+    build: .
+    image: news-guide-ab:latest
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      DATABASE_PATH: /data/experiment.sqlite3
+    volumes:
+      - experiment-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  experiment-data:
